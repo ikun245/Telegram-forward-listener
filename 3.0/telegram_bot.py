@@ -28,11 +28,9 @@ if proxy_config and proxy_config.get('proxy_type'):
     proxy_password = proxy_config.get('password')
 
     if proxy_type.lower() == 'socks5':
-        from telethon.network.connection.socksproxy import Socks5Proxy
-        proxy = Socks5Proxy(proxy_addr, proxy_port, proxy_username, proxy_password)
+        proxy = ('socks5', proxy_addr, proxy_port, proxy_username, proxy_password)
     elif proxy_type.lower() == 'http':
-        from telethon.network.connection.httpproxy import HttpProxy
-        proxy = HttpProxy(proxy_addr, proxy_port, proxy_username, proxy_password)
+        proxy = ('http', proxy_addr, proxy_port, proxy_username, proxy_password)
     else:
         print(f"不支持的代理类型: {proxy_type}")
         proxy = None
