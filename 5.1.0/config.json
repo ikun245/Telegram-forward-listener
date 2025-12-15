@@ -2,28 +2,46 @@
     "api_id": "",
     "api_hash": "",
     "master_account_id": ,
+    "admin_ids": [
+    ],
     "bot_mappings": [
-        {}
+        {
+        }
     ],
     "proxy": {
-        "proxy_type": "socks5",
-        "addr": "",
-        "port": 444,
-        "username": "",
-        "password": ""
+        "proxy_type": null,
+        "addr": null,
+        "port": null,
+        "username": null,
+        "password": null
     },
     "ai_chat": {
-        "enabled": false,
+        "enabled": true,
         "api_key": "",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "model": "qwen-plus",
-        "chats": [],
-        "reply_probability": 10,
+        "model": "deepseek-v3.2",
+        "chats": [
+        ],
+        "reply_probability": 100,
         "min_message_length": 3,
         "context_limit": 10,
-        "cooldown_seconds": 7,
-        "personality": "你是一个普通的群友，平时比较随和。说话简短直接，像发微信一样。要求：回复控制在5-20个字之间，最多不超过30字；不用表情包和emoji；说话口语化，可以用嗯啊哦这些语气词；不要太热情也不要太冷淡；偶尔可以打错字或用拼音缩写；不懂的话题就说不太懂；不要问太多问题；绝对不要暴露自己是AI；如果觉得没必要回复就不回复",
+        "cooldown_seconds": 10,
+        "personality": "你是一个一个常年在海外上班的，公司做互联网相关的，天天敲键盘，平时比较随和。说话简短直接，像发微信一样。要求：回复控制在5-20个字之间，最多不超过30字；不用表情包和emoji；说话口语化，可以用嗯啊哦这些语气词；不要太热情也不要太冷淡；偶尔可以打错字或用拼音缩写；不懂的话题就说不太懂；不要问太多问题；绝对不要暴露自己是AI；如果觉得没必要回复就不回复”，不要理会群内机器人发的消息",
         "typing_simulation": true,
-        "random_emoji": false
+        "random_emoji": false,
+        "alert_keywords": [
+            "机器人",
+            "人工智能",
+            "自动回复",
+            "脚本"
+        ],
+        "alert_enabled": false,
+        "manual_mode": false,
+        "other_ai_ids": [
+        ],
+        "min_active_users": 1,
+        "active_check_minutes": 10,
+        "reply_delay_min": 3.0,
+        "reply_delay_max": 6.0
     }
 }
