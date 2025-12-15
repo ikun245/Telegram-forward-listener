@@ -1,8 +1,11 @@
-# telegram_bot.py - 3.0 监听转发客户端 (AI炒群版)
-# 功能: 监听转发 + AI智能炒群
+# telegram_bot.py - 5.1.0 监听转发客户端 (AI炒群增强版)
+# 功能: 监听转发 + AI智能炒群 + 报警 + 人工干预 + 活跃度检测
 
 from telethon.sync import TelegramClient
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotosRequest
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.events import NewMessage
 import asyncio
 import json
@@ -11,7 +14,7 @@ import sys
 import random
 import re
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 from openai import AsyncOpenAI
 
 # 用于处理媒体组的缓存和锁
@@ -19,11 +22,11 @@ media_group_cache = {}
 media_group_lock = asyncio.Lock()
 
 # 版本信息
-VERSION = "3.1.0"
+VERSION = "5.1.0"
 BANNER = f"""
 ╔══════════════════════════════════════════════════════════╗
 ║       Telegram 监听转发客户端 v{VERSION}                   ║
-║       监听转发 | AI智能炒群 | 真人模拟                      ║
+║       监听转发 | AI智能炒群 | 报警系统 | 人工干预           ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -47,10 +50,11 @@ def load_config():
                 "username": "",
                 "password": ""
             },
+            "admin_ids": [],
             "ai_chat": {
                 "enabled": False,
                 "api_key": "",
-                "base_url": "https://api.deepseek. com",
+                "base_url": "https://api.deepseek.com",
                 "model": "deepseek-chat",
                 "chats": [],
                 "reply_probability": 30,
@@ -60,6 +64,14 @@ def load_config():
                 "personality": "你是一个活泼开朗的年轻人，喜欢用网络用语，说话简短有趣，偶尔会用emoji。你的回复要像真人聊天一样自然，不要太正式，可以有点调皮。回复尽量简短，一般1-2句话，最多不超过50字。不要暴露自己是AI。",
                 "typing_simulation": True,
                 "random_emoji": True,
+                "alert_keywords": ["机器人", "bot", "AI", "人工智能", "自动回复", "脚本"],
+                "alert_enabled": True,
+                "manual_mode": False,
+                "other_ai_ids": [],
+                "min_active_users": 3,
+                "active_check_minutes": 10,
+                "reply_delay_min": 2,
+                "reply_delay_max": 5,
             }
         }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -83,15 +95,23 @@ config = load_config()
 api_id = config['api_id']
 api_hash = config['api_hash']
 master_account_id = config['master_account_id']
+admin_ids = config.get('admin_ids', [])  # 额外管理员ID列表
 bot_mappings = config.get('bot_mappings', [])
 proxy_config = config.get('proxy', None)
+
+
+def is_admin(user_id: int) -> bool:
+    """检查用户是否是管理员（主账号或额外管理员）"""
+    if user_id == master_account_id:
+        return True
+    return user_id in admin_ids
 
 # 确保 ai_chat 配置存在
 if 'ai_chat' not in config:
     config['ai_chat'] = {
         "enabled": False,
         "api_key": "",
-        "base_url": "https://api. deepseek.com",
+        "base_url": "https://api.deepseek.com",
         "model": "deepseek-chat",
         "chats": [],
         "reply_probability": 30,
@@ -101,8 +121,32 @@ if 'ai_chat' not in config:
         "personality": "你是一个活泼开朗的年轻人，喜欢用网络用语，说话简短有趣，偶尔会用emoji。你的回复要像真人聊天一样自然，不要太正式，可以有点调皮。回复尽量简短，一般1-2句话，最多不超过50字。不要暴露自己是AI。",
         "typing_simulation": True,
         "random_emoji": True,
+        "alert_keywords": ["机器人", "bot", "AI", "人工智能", "自动回复", "脚本"],
+        "alert_enabled": True,
+        "manual_mode": False,
+        "other_ai_ids": [],
+        "min_active_users": 3,
+        "active_check_minutes": 10,
+        "reply_delay_min": 2,
+        "reply_delay_max": 5,
     }
     save_config(config)
+
+# 确保新增配置项存在
+ai_chat_defaults = {
+    "alert_keywords": ["机器人", "bot", "AI", "人工智能", "自动回复", "脚本"],
+    "alert_enabled": True,
+    "manual_mode": False,
+    "other_ai_ids": [],
+    "min_active_users": 3,
+    "active_check_minutes": 10,
+    "reply_delay_min": 2,
+    "reply_delay_max": 5,
+}
+for key, value in ai_chat_defaults.items():
+    if key not in config['ai_chat']:
+        config['ai_chat'][key] = value
+        save_config(config)
 
 # 配置代理
 proxy = None
@@ -140,6 +184,16 @@ class AIChatManager:
         self.chat_contexts = defaultdict(list)
         self.last_reply_time = defaultdict(lambda: datetime.min)
         self.my_user_id = None
+        
+        # 活跃度追踪 - 记录每个群组最近发言的用户
+        self.recent_senders = defaultdict(lambda: deque(maxlen=50))
+        
+        # 报警状态
+        self.alert_triggered = defaultdict(bool)
+        self.alert_messages = defaultdict(list)
+        
+        # 待发送的人工消息队列
+        self.manual_message_queue = defaultdict(list)
 
         self.emojis = ['😂', '🤣', '😊', '😄', '👍', '🔥', '💪', '😎', '🤔', '😏',
                        '🙃', '😜', '🤭', '😁', '👀', '💯', '✨', '🎉', '😋', '🥰',
@@ -173,7 +227,64 @@ class AIChatManager:
         ai_config = self.config.get('ai_chat', {})
         if not ai_config.get('enabled', False):
             return False
+        # 检查是否处于人工模式
+        if ai_config.get('manual_mode', False):
+            return False
         return chat_id in ai_config.get('chats', [])
+
+    def is_manual_mode(self) -> bool:
+        """检查是否处于人工干预模式"""
+        ai_config = self.config.get('ai_chat', {})
+        return ai_config.get('manual_mode', False)
+
+    def is_other_ai(self, user_id: int) -> bool:
+        """检查是否是其他AI的ID"""
+        ai_config = self.config.get('ai_chat', {})
+        other_ai_ids = ai_config.get('other_ai_ids', [])
+        return user_id in other_ai_ids
+
+    def check_alert_keywords(self, message_text: str) -> tuple:
+        """检查消息中是否包含报警关键词"""
+        ai_config = self.config.get('ai_chat', {})
+        if not ai_config.get('alert_enabled', True):
+            return False, None
+        
+        keywords = ai_config.get('alert_keywords', [])
+        message_lower = message_text.lower()
+        
+        for keyword in keywords:
+            if keyword.lower() in message_lower:
+                return True, keyword
+        return False, None
+
+    def track_sender(self, chat_id: int, sender_id: int):
+        """追踪发言者"""
+        now = datetime.now()
+        self.recent_senders[chat_id].append({
+            'sender_id': sender_id,
+            'time': now
+        })
+
+    def get_active_users_count(self, chat_id: int) -> int:
+        """获取指定时间段内的活跃用户数"""
+        ai_config = self.config.get('ai_chat', {})
+        check_minutes = ai_config.get('active_check_minutes', 10)
+        cutoff_time = datetime.now() - timedelta(minutes=check_minutes)
+        
+        # 获取时间范围内的不同发送者
+        unique_senders = set()
+        for record in self.recent_senders[chat_id]:
+            if record['time'] >= cutoff_time:
+                unique_senders.add(record['sender_id'])
+        
+        return len(unique_senders)
+
+    def should_skip_due_to_low_activity(self, chat_id: int) -> bool:
+        """检查是否因活跃度过低而跳过回复"""
+        ai_config = self.config.get('ai_chat', {})
+        min_users = ai_config.get('min_active_users', 3)
+        active_count = self.get_active_users_count(chat_id)
+        return active_count < min_users
 
     def should_reply(self, chat_id: int, message_text: str) -> bool:
         """判断是否应该回复"""
@@ -277,15 +388,49 @@ class AIChatManager:
             print(f"❌ AI 生成回复失败: {e}")
             return None
 
-    async def simulate_typing(self, text: str) -> float:
+    async def simulate_typing(self, text: str, is_direct_reply: bool = False) -> float:
         """模拟打字延迟"""
         ai_config = self.config.get('ai_chat', {})
         if not ai_config.get('typing_simulation', True):
             return 0
 
+        # 如果是被@或回复，使用更长的延迟模拟思考和打字
+        if is_direct_reply:
+            delay_min = ai_config.get('reply_delay_min', 2)
+            delay_max = ai_config.get('reply_delay_max', 5)
+            return random.uniform(delay_min, delay_max)
+        
         base_delay = len(text) * random.uniform(0.1, 0.2)
         delay = base_delay + random.uniform(0.5, 2.0)
         return min(delay, 5.0)
+
+    def trigger_alert(self, chat_id: int, keyword: str, message_text: str, sender_name: str):
+        """触发报警"""
+        self.alert_triggered[chat_id] = True
+        self.alert_messages[chat_id].append({
+            'keyword': keyword,
+            'message': message_text,
+            'sender': sender_name,
+            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
+
+    def clear_alert(self, chat_id: int):
+        """清除报警状态"""
+        self.alert_triggered[chat_id] = False
+        self.alert_messages[chat_id] = []
+
+    def add_manual_message(self, chat_id: int, message: str, reply_to: int = None):
+        """添加人工消息到队列"""
+        self.manual_message_queue[chat_id].append({
+            'message': message,
+            'reply_to': reply_to
+        })
+
+    def get_manual_message(self, chat_id: int):
+        """获取并移除队列中的第一条人工消息"""
+        if self.manual_message_queue[chat_id]:
+            return self.manual_message_queue[chat_id].pop(0)
+        return None
 
 
 # 创建 AI 聊天管理器
@@ -366,10 +511,22 @@ async def handler(event):
 
 async def handle_ai_chat(event):
     """处理 AI 炒群"""
+    global config
+    
+    me = await client.get_me()
+    
+    # 先追踪发言者（无论是否启用AI）
+    if event.sender_id:
+        ai_manager.track_sender(event.chat_id, event.sender_id)
+    
+    # 检查是否是其他AI的消息，避免互相扯皮
+    if ai_manager.is_other_ai(event.sender_id):
+        print(f"🚫 跳过其他AI [{event.sender_id}] 的消息")
+        return
+    
     if not ai_manager.is_enabled(event.chat_id):
         return
 
-    me = await client.get_me()
     if event.sender_id == me.id:
         return
 
@@ -385,21 +542,52 @@ async def handle_ai_chat(event):
     except:
         sender_name = "某人"
 
+    # 检查报警关键词
+    has_alert, keyword = ai_manager.check_alert_keywords(message_text)
+    if has_alert:
+        ai_manager.trigger_alert(event.chat_id, keyword, message_text, sender_name)
+        
+        # 通知管理员
+        try:
+            alert_msg = f"""
+🚨 *报警触发!*
+
+📍 群组ID: `{event.chat_id}`
+🔑 触发关键词: `{keyword}`
+👤 发送者: {sender_name}
+💬 消息内容: {message_text[:200]}
+
+⚠️ AI炒群已自动暂停，使用 `/ai resume {event.chat_id}` 恢复
+或使用 `/manual on` 切换到人工模式
+"""
+            await client.send_message(master_account_id, alert_msg, parse_mode='Markdown')
+            print(f"🚨 报警触发: 群组 {event.chat_id}, 关键词: {keyword}")
+        except Exception as e:
+            print(f"❌ 发送报警通知失败: {e}")
+        return
+
+    # 检查该群是否已触发报警
+    if ai_manager.alert_triggered.get(event.chat_id, False):
+        return
+
     ai_manager.add_context(event.chat_id, sender_name, message_text)
 
     is_mentioned = False
     is_reply_to_me = False
+    is_direct_reply = False
 
     my_username = me.username or ""
 
     if my_username and f"@{my_username}" in message_text:
         is_mentioned = True
+        is_direct_reply = True
 
     if event.message.reply_to_msg_id:
         try:
             replied_msg = await event.message.get_reply_message()
             if replied_msg and replied_msg.sender_id == me.id:
                 is_reply_to_me = True
+                is_direct_reply = True
         except:
             pass
 
@@ -408,6 +596,10 @@ async def handle_ai_chat(event):
     if is_mentioned or is_reply_to_me:
         should_reply = random.randint(1, 100) <= 90
     else:
+        # 检查活跃度
+        if ai_manager.should_skip_due_to_low_activity(event.chat_id):
+            print(f"⏸️ 群组 {event.chat_id} 活跃用户过少，跳过回复")
+            return
         should_reply = ai_manager.should_reply(event.chat_id, message_text)
 
     if not should_reply:
@@ -418,7 +610,8 @@ async def handle_ai_chat(event):
     if not reply:
         return
 
-    typing_delay = await ai_manager.simulate_typing(reply)
+    # 根据是否是直接回复决定延迟时间
+    typing_delay = await ai_manager.simulate_typing(reply, is_direct_reply)
     if typing_delay > 0:
         try:
             async with client.action(event.chat_id, 'typing'):
@@ -530,6 +723,37 @@ def get_help_text():
 • `/ai baseurl <url>` - 设置API地址
 • `/ai model <model>` - 设置模型
 
+🚨 *报警与人工干预:*
+• `/ai alert on/off` - 开启/关闭报警功能
+• `/ai alert add <关键词>` - 添加报警关键词
+• `/ai alert remove <关键词>` - 移除报警关键词
+• `/ai alert list` - 列出报警关键词
+• `/ai resume <群组ID>` - 恢复指定群的AI
+• `/manual on` - 切换到人工干预模式
+• `/manual off` - 关闭人工干预模式
+• `/manual send <群组ID> <消息>` - 人工发送消息
+• `/manual reply <群组ID> <消息ID> <消息>` - 回复指定消息
+
+🤖 *多AI防扯皮:*
+• `/ai addbot <用户ID>` - 添加其他AI的ID
+• `/ai removebot <用户ID>` - 移除其他AI的ID
+• `/ai listbot` - 列出所有AI ID
+
+📊 *活跃度设置:*
+• `/ai minusers <数量>` - 设置最少活跃用户数
+• `/ai checktime <分钟>` - 设置活跃检查时间
+• `/ai delay <最小秒> <最大秒>` - 设置回复延迟
+
+👤 *账号管理:*
+• `/profile name <名字>` - 修改名字
+• `/profile bio <简介>` - 修改简介
+• `/profile photo` - 修改头像(回复图片使用)
+
+👥 *管理员设置:* (仅主账号可用)
+• `/admin add <用户ID>` - 添加管理员
+• `/admin remove <用户ID>` - 移除管理员
+• `/admin list` - 列出所有管理员
+
 📊 *其他:*
 • `/myid` - 获取您的用户ID
 • `/chatid` - 获取聊天ID
@@ -600,7 +824,9 @@ async def handle_ai_command(event, args: str):
         if chats:
             text = "🤖 *AI炒群群组列表:*\n\n"
             for i, cid in enumerate(chats, 1):
-                text += f"{i}. `{cid}`\n"
+                alert_status = "🚨" if ai_manager.alert_triggered.get(cid, False) else "✅"
+                active_count = ai_manager.get_active_users_count(cid)
+                text += f"{i}. `{cid}` {alert_status} (活跃: {active_count}人)\n"
             await event.reply(text, parse_mode='Markdown')
         else:
             await event.reply("📋 暂无炒群群组")
@@ -658,6 +884,16 @@ async def handle_ai_command(event, args: str):
         cooldown = ai_config.get('cooldown_seconds', 30)
         min_len = ai_config.get('min_message_length', 3)
         personality = ai_config.get('personality', '未设置')[:100]
+        
+        # 新增状态
+        alert_enabled = "✅ 开启" if ai_config.get('alert_enabled', True) else "❌ 关闭"
+        manual_mode = "✅ 开启" if ai_config.get('manual_mode', False) else "❌ 关闭"
+        min_users = ai_config.get('min_active_users', 3)
+        check_time = ai_config.get('active_check_minutes', 10)
+        delay_min = ai_config.get('reply_delay_min', 2)
+        delay_max = ai_config.get('reply_delay_max', 5)
+        other_ais = len(ai_config.get('other_ai_ids', []))
+        alert_keywords = ai_config.get('alert_keywords', [])
 
         status_text = f"""
 🤖 *AI炒群状态*
@@ -668,6 +904,19 @@ async def handle_ai_command(event, args: str):
 • 回复概率: {prob}%
 • 冷却时间: {cooldown}秒
 • 最小触发长度: {min_len}字
+
+🚨 *报警设置:*
+• 报警功能: {alert_enabled}
+• 人工模式: {manual_mode}
+• 报警关键词: {', '.join(alert_keywords[:5])}{'...' if len(alert_keywords) > 5 else ''}
+
+📊 *活跃度设置:*
+• 最少活跃用户: {min_users}人
+• 检查时间: {check_time}分钟
+• 回复延迟: {delay_min}-{delay_max}秒
+
+🤖 *防扯皮:*
+• 其他AI数量: {other_ais}
 
 📝 *当前人设:*
 {personality}... 
@@ -730,8 +979,439 @@ async def handle_ai_command(event, args: str):
         save_config(config)
         await event.reply(f"✅ 模型已设置为: {sub_args}")
 
+    # ========== 报警功能 ==========
+    elif sub_cmd == 'alert':
+        alert_parts = sub_args.strip().split(' ', 1)
+        alert_cmd = alert_parts[0].lower() if alert_parts else ""
+        alert_args = alert_parts[1] if len(alert_parts) > 1 else ""
+        
+        if alert_cmd == 'on':
+            ai_config['alert_enabled'] = True
+            config['ai_chat'] = ai_config
+            save_config(config)
+            await event.reply("✅ 报警功能已开启")
+        
+        elif alert_cmd == 'off':
+            ai_config['alert_enabled'] = False
+            config['ai_chat'] = ai_config
+            save_config(config)
+            await event.reply("✅ 报警功能已关闭")
+        
+        elif alert_cmd == 'add':
+            if not alert_args:
+                await event.reply("❌ 用法: `/ai alert add <关键词>`", parse_mode='Markdown')
+                return
+            keywords = ai_config.get('alert_keywords', [])
+            if alert_args not in keywords:
+                keywords.append(alert_args)
+                ai_config['alert_keywords'] = keywords
+                config['ai_chat'] = ai_config
+                save_config(config)
+                await event.reply(f"✅ 已添加报警关键词: `{alert_args}`", parse_mode='Markdown')
+            else:
+                await event.reply("❌ 该关键词已存在")
+        
+        elif alert_cmd == 'remove':
+            if not alert_args:
+                await event.reply("❌ 用法: `/ai alert remove <关键词>`", parse_mode='Markdown')
+                return
+            keywords = ai_config.get('alert_keywords', [])
+            if alert_args in keywords:
+                keywords.remove(alert_args)
+                ai_config['alert_keywords'] = keywords
+                config['ai_chat'] = ai_config
+                save_config(config)
+                await event.reply(f"✅ 已移除报警关键词: `{alert_args}`", parse_mode='Markdown')
+            else:
+                await event.reply("❌ 该关键词不存在")
+        
+        elif alert_cmd == 'list':
+            keywords = ai_config.get('alert_keywords', [])
+            if keywords:
+                text = "🚨 *报警关键词列表:*\n\n"
+                for i, kw in enumerate(keywords, 1):
+                    text += f"{i}. `{kw}`\n"
+                await event.reply(text, parse_mode='Markdown')
+            else:
+                await event.reply("📋 暂无报警关键词")
+        
+        else:
+            await event.reply("❌ 用法: `/ai alert on/off/add/remove/list`", parse_mode='Markdown')
+
+    elif sub_cmd == 'resume':
+        if not sub_args:
+            await event.reply("❌ 用法: `/ai resume <群组ID>`", parse_mode='Markdown')
+            return
+        try:
+            chat_id = int(sub_args)
+            if ai_manager.alert_triggered.get(chat_id, False):
+                ai_manager.clear_alert(chat_id)
+                await event.reply(f"✅ 已恢复群组 `{chat_id}` 的AI炒群", parse_mode='Markdown')
+            else:
+                await event.reply("ℹ️ 该群组未触发报警")
+        except ValueError:
+            await event.reply("❌ 请输入有效的群组ID")
+
+    # ========== 多AI防扯皮 ==========
+    elif sub_cmd == 'addbot':
+        if not sub_args:
+            await event.reply("❌ 用法: `/ai addbot <用户ID>`", parse_mode='Markdown')
+            return
+        try:
+            bot_id = int(sub_args)
+            other_ais = ai_config.get('other_ai_ids', [])
+            if bot_id not in other_ais:
+                other_ais.append(bot_id)
+                ai_config['other_ai_ids'] = other_ais
+                config['ai_chat'] = ai_config
+                save_config(config)
+                ai_manager.update_config(config)
+                await event.reply(f"✅ 已添加其他AI: `{bot_id}`", parse_mode='Markdown')
+            else:
+                await event.reply("❌ 该ID已在列表中")
+        except ValueError:
+            await event.reply("❌ 请输入有效的用户ID")
+
+    elif sub_cmd == 'removebot':
+        if not sub_args:
+            await event.reply("❌ 用法: `/ai removebot <用户ID>`", parse_mode='Markdown')
+            return
+        try:
+            bot_id = int(sub_args)
+            other_ais = ai_config.get('other_ai_ids', [])
+            if bot_id in other_ais:
+                other_ais.remove(bot_id)
+                ai_config['other_ai_ids'] = other_ais
+                config['ai_chat'] = ai_config
+                save_config(config)
+                ai_manager.update_config(config)
+                await event.reply(f"✅ 已移除其他AI: `{bot_id}`", parse_mode='Markdown')
+            else:
+                await event.reply("❌ 该ID不在列表中")
+        except ValueError:
+            await event.reply("❌ 请输入有效的用户ID")
+
+    elif sub_cmd == 'listbot':
+        other_ais = ai_config.get('other_ai_ids', [])
+        if other_ais:
+            text = "🤖 *其他AI ID列表:*\n\n"
+            for i, aid in enumerate(other_ais, 1):
+                text += f"{i}. `{aid}`\n"
+            await event.reply(text, parse_mode='Markdown')
+        else:
+            await event.reply("📋 暂无其他AI ID")
+
+    # ========== 活跃度设置 ==========
+    elif sub_cmd == 'minusers':
+        if not sub_args:
+            current = ai_config.get('min_active_users', 3)
+            await event.reply(f"当前最少活跃用户数: {current}\n用法: `/ai minusers <数量>`", parse_mode='Markdown')
+            return
+        try:
+            num = int(sub_args)
+            if num >= 0:
+                ai_config['min_active_users'] = num
+                config['ai_chat'] = ai_config
+                save_config(config)
+                await event.reply(f"✅ 最少活跃用户数已设置为: {num}")
+            else:
+                await event.reply("❌ 数量不能为负数")
+        except ValueError:
+            await event.reply("❌ 请输入有效的数字")
+
+    elif sub_cmd == 'checktime':
+        if not sub_args:
+            current = ai_config.get('active_check_minutes', 10)
+            await event.reply(f"当前活跃检查时间: {current}分钟\n用法: `/ai checktime <分钟>`", parse_mode='Markdown')
+            return
+        try:
+            mins = int(sub_args)
+            if mins > 0:
+                ai_config['active_check_minutes'] = mins
+                config['ai_chat'] = ai_config
+                save_config(config)
+                await event.reply(f"✅ 活跃检查时间已设置为: {mins}分钟")
+            else:
+                await event.reply("❌ 时间必须大于0")
+        except ValueError:
+            await event.reply("❌ 请输入有效的数字")
+
+    elif sub_cmd == 'delay':
+        if not sub_args:
+            delay_min = ai_config.get('reply_delay_min', 2)
+            delay_max = ai_config.get('reply_delay_max', 5)
+            await event.reply(f"当前回复延迟: {delay_min}-{delay_max}秒\n用法: `/ai delay <最小秒> <最大秒>`", parse_mode='Markdown')
+            return
+        try:
+            delay_parts = sub_args.split()
+            if len(delay_parts) != 2:
+                await event.reply("❌ 用法: `/ai delay <最小秒> <最大秒>`", parse_mode='Markdown')
+                return
+            delay_min = float(delay_parts[0])
+            delay_max = float(delay_parts[1])
+            if delay_min >= 0 and delay_max >= delay_min:
+                ai_config['reply_delay_min'] = delay_min
+                ai_config['reply_delay_max'] = delay_max
+                config['ai_chat'] = ai_config
+                save_config(config)
+                await event.reply(f"✅ 回复延迟已设置为: {delay_min}-{delay_max}秒")
+            else:
+                await event.reply("❌ 延迟时间无效")
+        except ValueError:
+            await event.reply("❌ 请输入有效的数字")
+
     else:
         await event.reply("❌ 未知命令，使用 `/help` 查看帮助", parse_mode='Markdown')
+
+
+async def handle_manual_command(event, args: str):
+    """处理人工干预命令"""
+    global config
+    
+    parts = args.strip().split(' ', 2)
+    sub_cmd = parts[0].lower() if parts else ""
+    
+    ai_config = config.get('ai_chat', {})
+    
+    if sub_cmd == 'on':
+        ai_config['manual_mode'] = True
+        config['ai_chat'] = ai_config
+        save_config(config)
+        ai_manager.update_config(config)
+        await event.reply("✅ 已切换到人工干预模式，AI将暂停自动回复")
+    
+    elif sub_cmd == 'off':
+        ai_config['manual_mode'] = False
+        config['ai_chat'] = ai_config
+        save_config(config)
+        ai_manager.update_config(config)
+        await event.reply("✅ 已关闭人工干预模式，AI恢复自动回复")
+    
+    elif sub_cmd == 'send':
+        if len(parts) < 3:
+            await event.reply("❌ 用法: `/manual send <群组ID> <消息>`", parse_mode='Markdown')
+            return
+        try:
+            chat_id = int(parts[1])
+            message = parts[2]
+            
+            # 模拟打字延迟
+            delay = random.uniform(1, 3)
+            try:
+                async with client.action(chat_id, 'typing'):
+                    await asyncio.sleep(delay)
+            except:
+                await asyncio.sleep(delay)
+            
+            await client.send_message(chat_id, message)
+            await event.reply(f"✅ 已向群组 `{chat_id}` 发送消息", parse_mode='Markdown')
+        except ValueError:
+            await event.reply("❌ 请输入有效的群组ID")
+        except Exception as e:
+            await event.reply(f"❌ 发送失败: {e}")
+    
+    elif sub_cmd == 'reply':
+        if len(parts) < 3:
+            await event.reply("❌ 用法: `/manual reply <群组ID> <消息ID> <消息>`\n或: `/manual reply <群组ID> <消息>` (回复最新消息)", parse_mode='Markdown')
+            return
+        try:
+            chat_id = int(parts[1])
+            remaining = parts[2].split(' ', 1)
+            
+            # 检查是否指定了消息ID
+            try:
+                reply_to_id = int(remaining[0])
+                message = remaining[1] if len(remaining) > 1 else ""
+            except ValueError:
+                # 没有指定消息ID，回复最新消息
+                reply_to_id = None
+                message = parts[2]
+            
+            if not message:
+                await event.reply("❌ 请输入要发送的消息")
+                return
+            
+            # 模拟打字延迟
+            delay = random.uniform(2, 4)
+            try:
+                async with client.action(chat_id, 'typing'):
+                    await asyncio.sleep(delay)
+            except:
+                await asyncio.sleep(delay)
+            
+            await client.send_message(chat_id, message, reply_to=reply_to_id)
+            await event.reply(f"✅ 已向群组 `{chat_id}` 发送回复", parse_mode='Markdown')
+        except ValueError:
+            await event.reply("❌ 请输入有效的群组ID")
+        except Exception as e:
+            await event.reply(f"❌ 发送失败: {e}")
+    
+    elif sub_cmd == 'status':
+        manual_mode = "✅ 开启" if ai_config.get('manual_mode', False) else "❌ 关闭"
+        
+        # 列出已触发报警的群组
+        alert_chats = [cid for cid, triggered in ai_manager.alert_triggered.items() if triggered]
+        
+        status_text = f"""
+🖐️ *人工干预状态*
+
+• 人工模式: {manual_mode}
+• 报警群组数: {len(alert_chats)}
+"""
+        if alert_chats:
+            status_text += "\n🚨 *已报警群组:*\n"
+            for cid in alert_chats:
+                alerts = ai_manager.alert_messages.get(cid, [])
+                if alerts:
+                    last_alert = alerts[-1]
+                    status_text += f"• `{cid}` - {last_alert['keyword']} ({last_alert['time']})\n"
+        
+        await event.reply(status_text, parse_mode='Markdown')
+    
+    else:
+        await event.reply("❌ 用法: `/manual on/off/send/reply/status`", parse_mode='Markdown')
+
+
+async def handle_profile_command(event, args: str):
+    """处理账号资料命令"""
+    parts = args.strip().split(' ', 1)
+    sub_cmd = parts[0].lower() if parts else ""
+    sub_args = parts[1] if len(parts) > 1 else ""
+    
+    if sub_cmd == 'name':
+        if not sub_args:
+            me = await client.get_me()
+            current = f"{me.first_name or ''} {me.last_name or ''}".strip()
+            await event.reply(f"当前名字: {current}\n用法: `/profile name <名字>` 或 `/profile name <名字> <姓氏>`", parse_mode='Markdown')
+            return
+        
+        try:
+            name_parts = sub_args.split(' ', 1)
+            first_name = name_parts[0]
+            last_name = name_parts[1] if len(name_parts) > 1 else ''
+            
+            await client(UpdateProfileRequest(
+                first_name=first_name,
+                last_name=last_name
+            ))
+            await event.reply(f"✅ 名字已修改为: {first_name} {last_name}".strip())
+        except Exception as e:
+            await event.reply(f"❌ 修改失败: {e}")
+    
+    elif sub_cmd == 'bio':
+        if not sub_args:
+            try:
+                full = await client(GetFullUserRequest('me'))
+                current_bio = full.full_user.about or "未设置"
+                await event.reply(f"当前简介: {current_bio}\n用法: `/profile bio <简介>`", parse_mode='Markdown')
+            except:
+                await event.reply("用法: `/profile bio <简介>`", parse_mode='Markdown')
+            return
+        
+        try:
+            await client(UpdateProfileRequest(about=sub_args))
+            await event.reply(f"✅ 简介已修改为: {sub_args}")
+        except Exception as e:
+            await event.reply(f"❌ 修改失败: {e}")
+    
+    elif sub_cmd == 'photo':
+        # 检查是否回复了图片消息
+        if not event.reply_to_msg_id:
+            await event.reply("❌ 请回复一张图片使用此命令")
+            return
+        
+        try:
+            replied = await event.get_reply_message()
+            if not replied.photo:
+                await event.reply("❌ 回复的消息不是图片")
+                return
+            
+            # 下载图片
+            photo_path = await replied.download_media()
+            if not photo_path:
+                await event.reply("❌ 下载图片失败")
+                return
+            
+            # 上传为头像
+            await client(UploadProfilePhotoRequest(
+                file=await client.upload_file(photo_path)
+            ))
+            
+            # 删除临时文件
+            try:
+                os.remove(photo_path)
+            except:
+                pass
+            
+            await event.reply("✅ 头像已更新")
+        except Exception as e:
+            await event.reply(f"❌ 修改失败: {e}")
+    
+    else:
+        await event.reply("❌ 用法: `/profile name/bio/photo`", parse_mode='Markdown')
+
+
+async def handle_admin_command(event, args: str):
+    """处理管理员设置命令（仅主账号可用）"""
+    global config, admin_ids
+    
+    # 只有主账号可以管理管理员
+    if event.sender_id != master_account_id:
+        await event.reply("❌ 只有主账号可以管理管理员")
+        return
+    
+    parts = args.strip().split(' ', 1)
+    sub_cmd = parts[0].lower() if parts else ""
+    sub_args = parts[1] if len(parts) > 1 else ""
+    
+    if sub_cmd == 'add':
+        if not sub_args:
+            await event.reply("❌ 用法: `/admin add <用户ID>`", parse_mode='Markdown')
+            return
+        try:
+            user_id = int(sub_args)
+            if user_id == master_account_id:
+                await event.reply("❌ 主账号无需添加")
+                return
+            if user_id not in admin_ids:
+                admin_ids.append(user_id)
+                config['admin_ids'] = admin_ids
+                save_config(config)
+                await event.reply(f"✅ 已添加管理员: `{user_id}`", parse_mode='Markdown')
+            else:
+                await event.reply("❌ 该用户已是管理员")
+        except ValueError:
+            await event.reply("❌ 请输入有效的用户ID")
+    
+    elif sub_cmd == 'remove':
+        if not sub_args:
+            await event.reply("❌ 用法: `/admin remove <用户ID>`", parse_mode='Markdown')
+            return
+        try:
+            user_id = int(sub_args)
+            if user_id in admin_ids:
+                admin_ids.remove(user_id)
+                config['admin_ids'] = admin_ids
+                save_config(config)
+                await event.reply(f"✅ 已移除管理员: `{user_id}`", parse_mode='Markdown')
+            else:
+                await event.reply("❌ 该用户不是管理员")
+        except ValueError:
+            await event.reply("❌ 请输入有效的用户ID")
+    
+    elif sub_cmd == 'list':
+        text = "👥 *管理员列表:*\n\n"
+        text += f"👑 主账号: `{master_account_id}`\n\n"
+        if admin_ids:
+            text += "📋 *其他管理员:*\n"
+            for i, aid in enumerate(admin_ids, 1):
+                text += f"{i}. `{aid}`\n"
+        else:
+            text += "暂无其他管理员"
+        await event.reply(text, parse_mode='Markdown')
+    
+    else:
+        await event.reply("❌ 用法: `/admin add/remove/list`", parse_mode='Markdown')
 
 
 async def main():
@@ -763,10 +1443,10 @@ async def main():
     print("💡 机器人正在运行，等待消息...")
     print("=" * 60)
 
-    # 处理来自主账号的命令
-    @client.on(NewMessage(func=lambda e: e.is_private and e.sender_id == master_account_id))
+    # 处理来自管理员的命令
+    @client.on(NewMessage(func=lambda e: e.is_private and is_admin(e.sender_id)))
     async def command_handler(event):
-        global bot_running, config
+        global bot_running, config, admin_ids
 
         text = event.message.text or ""
         command = text.split(' ', 1)
@@ -945,6 +1625,15 @@ async def main():
 
         elif cmd == '/ai':
             await handle_ai_command(event, args)
+
+        elif cmd == '/manual':
+            await handle_manual_command(event, args)
+
+        elif cmd == '/profile':
+            await handle_profile_command(event, args)
+
+        elif cmd == '/admin':
+            await handle_admin_command(event, args)
 
     # 保持运行
     print("🚀 开始监听消息...")
