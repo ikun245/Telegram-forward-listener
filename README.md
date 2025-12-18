@@ -61,11 +61,20 @@ password: xxxxxxx`
 ![](https://fastly.jsdelivr.net/gh/bucketio/img0@main/2025/12/18/1766053742255-fde6ddc1-08a9-4a81-bab4-d5fab4628c66.png)
 配置好后，记住路径
 进入终端
-*cd  /www/wwwroot/telegram/5.1.0
-python3 -m pip install -r requirements.txt
-sudo apt install tmux
-tmux new -s telegram
-python3 telegram.py*
+依次执行
+`cd  /www/wwwroot/telegram/5.1.0`
+
+
+`python3 -m pip install -r requirements.txt`
+
+
+`sudo apt install tmux`
+
+
+`tmux new -s telegram`
+
+
+`python3 telegram.py`
 ***即可进入界面，按着提示，输入账号，验证码，2FA即可登录（一定要配置好master_id)***、
 
 ![](https://fastly.jsdelivr.net/gh/bucketio/img15@main/2025/12/18/1766055452904-f05121f5-69d2-4a44-85b8-bc7e28ba5a17.png)
