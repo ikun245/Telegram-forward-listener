@@ -17,6 +17,8 @@
 推荐使用Finalshell或者xshell，以finalshell为例：[Finalshell下载](https://jisou.fun/sites/195.html/)
 按提示安装成功后，建立ssh链接服务
 ![](https://fastly.jsdelivr.net/gh/bucketio/img15@main/2025/12/18/1766052370827-cb572509-6c54-4a4b-b5ea-613ec2f51e4b.png)
+
+
 进行配置并保存
 ![](https://fastly.jsdelivr.net/gh/bucketio/img18@main/2025/12/18/1766052447505-72b94344-39f5-4052-9a6f-4d9eaeb0c0f0.png)
 ## 推荐操作
