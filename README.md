@@ -20,6 +20,8 @@
 
 
 进行配置并保存
+
+
 ![](https://fastly.jsdelivr.net/gh/bucketio/img18@main/2025/12/18/1766052447505-72b94344-39f5-4052-9a6f-4d9eaeb0c0f0.png)
 ## 推荐操作
 对于小白，以及不是很熟悉linux系统的同学，可以进去，第一件事就是下载aapanel面板，使用下面命令进行更新下载aapanel
